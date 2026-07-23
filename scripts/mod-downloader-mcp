@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_ROOT=$(dirname -- "$SCRIPT_DIR")
+SECRETS=/var/home/jack/.bashrc.d/.secrets
+
+if [ -f "$SECRETS" ]; then
+	set -a
+	# shellcheck disable=SC1090
+	. "$SECRETS"
+	set +a
+fi
+
+PYTHONPATH=$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}
+export PYTHONPATH
+
+exec python3 -m nexusmods_mcp.server "$@"

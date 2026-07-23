@@ -1,0 +1,13 @@
+[project]
+name = "mod-downloader-mcp"
+version = "0.1.0"
+description = "MCP server for Nexus Mods API search, metadata, and downloads."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+mod-downloader-mcp = "nexusmods_mcp.server:main"
+nexusmods-mcp = "nexusmods_mcp.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

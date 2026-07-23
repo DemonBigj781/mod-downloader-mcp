@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+SECRETS=/var/home/jack/.bashrc.d/.secrets
+
+if [ -f "$SECRETS" ]; then
+	set -a
+	# shellcheck disable=SC1090
+	. "$SECRETS"
+	set +a
+fi
+
+PYTHONPATH=/var/home/jack/mcp_projects/nexusmods-mcp${PYTHONPATH:+:$PYTHONPATH}
+export PYTHONPATH
+
+exec python3 -m nexusmods_mcp.server "$@"
