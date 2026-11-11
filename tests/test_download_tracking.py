@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from pathlib import Path
 
 import pytest
 
@@ -130,9 +130,10 @@ def test_check_tracked_updates_reports_newer_nexus_file(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(server.client, "list_mod_files", lambda *_args: {
         "files": [
-            {"file_id": 22, "version": "2.0", "category_name": "MAIN", "uploaded_timestamp": 200},
+            {"file_id": 22, "version": "2.0", "category_name": "OLD_VERSION", "uploaded_timestamp": 200},
             {"file_id": 23, "version": "2.1", "category_name": "MAIN", "uploaded_timestamp": 300},
         ],
+        "file_updates": [{"old_file_id": 22, "new_file_id": 23, "uploaded_timestamp": 300}],
     })
     monkeypatch.setattr(server.client, "get_mod", lambda *_args: {"updated_timestamp": 300, "version": "2.1"})
 
@@ -142,6 +143,74 @@ def test_check_tracked_updates_reports_newer_nexus_file(monkeypatch, tmp_path):
     assert result["updates_available"] == 1
     assert result["results"][0]["update_available"] is True
     assert result["results"][0]["latest"]["file_id"] == 23
+    assert result["results"][0]["lineage"] == [22, 23]
+
+
+def test_nexus_update_check_tracks_every_file_on_multi_file_pages(monkeypatch, tmp_path):
+    server = McpServer(config(tmp_path))
+    for file_id in (22, 40):
+        archive = tmp_path / f"{file_id}.zip"
+        archive.write_bytes(str(file_id).encode())
+        server.tracker.record_download(
+            provider="nexus",
+            source_key="fixturegame:11",
+            artifact_id=str(file_id),
+            version="1.0",
+            remote_updated_at=file_id * 10,
+            local_path=archive,
+            size_bytes=archive.stat().st_size,
+            metadata={"game_domain_name": "fixturegame", "mod_id": 11, "file_id": file_id},
+        )
+    monkeypatch.setattr(server.client, "get_mod", lambda *_args: {
+        "name": "Multi-file Fixture",
+        "updated_timestamp": 900,
+    })
+    monkeypatch.setattr(server.client, "list_mod_files", lambda *_args: {
+        "files": [
+            {"file_id": 22, "version": "1.0", "category_name": "OLD_VERSION", "uploaded_timestamp": 220},
+            {"file_id": 23, "version": "2.0", "category_name": "MAIN", "uploaded_timestamp": 230},
+            {"file_id": 40, "version": "1.0", "category_name": "MAIN", "uploaded_timestamp": 400},
+            {"file_id": 99, "version": "9.0", "category_name": "MAIN", "uploaded_timestamp": 900},
+        ],
+        "file_updates": [{"old_file_id": 22, "new_file_id": 23, "uploaded_timestamp": 230}],
+    })
+
+    result = server.check_tracked_updates(provider="nexus")
+
+    assert result["tracked_sources"] == 2
+    assert result["updates_available"] == 1
+    by_file = {int(item["tracked"]["artifact_id"]): item for item in result["results"]}
+    assert by_file[22]["status"] == "update_available"
+    assert by_file[22]["latest"]["file_id"] == 23
+    assert by_file[40]["status"] == "current"
+    assert by_file[40]["update_available"] is False
+
+
+def test_nexus_inventory_check_does_not_redownload_a_replacement_already_present(monkeypatch, tmp_path):
+    server = McpServer(config(tmp_path))
+    monkeypatch.setattr(server.client, "get_mod", lambda *_args: {
+        "name": "Fixture Mod",
+        "author": "Fixture Author",
+    })
+    monkeypatch.setattr(server.client, "list_mod_files", lambda *_args: {
+        "files": [
+            {"file_id": 22, "version": "1.0", "category_name": "OLD_VERSION", "uploaded_timestamp": 220},
+            {"file_id": 23, "version": "2.0", "category_name": "MAIN", "uploaded_timestamp": 230},
+        ],
+        "file_updates": [{"old_file_id": 22, "new_file_id": 23, "uploaded_timestamp": 230}],
+    })
+
+    result = server.check_nexus_artifact_updates(
+        "fixturegame",
+        [{"mod_id": 11, "file_id": 22}, {"mod_id": 11, "file_id": 23}],
+    )
+
+    assert result["artifact_count"] == 2
+    assert result["updates_available"] == 0
+    by_file = {item["file_id"]: item for item in result["results"]}
+    assert by_file[22]["status"] == "superseded_in_inventory"
+    assert by_file[22]["lineage"] == [22, 23]
+    assert by_file[23]["status"] == "current"
 
 
 def test_nexus_update_check_does_not_treat_an_unrelated_file_as_an_update(monkeypatch, tmp_path):
@@ -176,8 +245,17 @@ def test_tool_catalog_exposes_staging_tracking_and_update_checks(tmp_path):
     server = McpServer(config(tmp_path))
     tools = {tool["name"]: tool for tool in server._tool_descriptions()}
 
-    assert {"get_download_staging", "list_tracked_downloads", "check_tracked_updates"} <= tools.keys()
+    assert {
+        "get_download_staging",
+        "list_tracked_downloads",
+        "check_tracked_updates",
+        "check_nexus_artifact_updates",
+    } <= tools.keys()
     assert "provider" in tools["check_tracked_updates"]["inputSchema"]["properties"]
+    assert tools["check_nexus_artifact_updates"]["inputSchema"]["required"] == [
+        "game_domain_name",
+        "artifacts",
+    ]
 
 
 def test_tracking_tools_are_callable_through_mcp_protocol(tmp_path):
@@ -207,6 +285,32 @@ def test_tracking_tools_are_callable_through_mcp_protocol(tmp_path):
         "only_updates": False,
         "results": [],
     }
+
+
+def test_nexus_inventory_update_check_is_callable_through_mcp_protocol(monkeypatch, tmp_path):
+    server = McpServer(config(tmp_path))
+    monkeypatch.setattr(server.client, "get_mod", lambda *_args: {"name": "Fixture Mod"})
+    monkeypatch.setattr(server.client, "list_mod_files", lambda *_args: {
+        "files": [{"file_id": 22, "version": "1.0", "category_name": "MAIN"}],
+        "file_updates": [],
+    })
+
+    response = server.handle({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "check_nexus_artifact_updates",
+            "arguments": {
+                "game_domain_name": "fixturegame",
+                "artifacts": [{"mod_id": 11, "file_id": 22}],
+            },
+        },
+    })
+
+    result = json.loads(response["result"]["content"][0]["text"])
+    assert result["updates_available"] == 0
+    assert result["results"][0]["status"] == "current"
 
 
 @pytest.mark.parametrize("provider", ["thunderstore", "curseforge", "steam"])

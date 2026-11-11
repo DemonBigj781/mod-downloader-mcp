@@ -55,11 +55,48 @@ Tracking tools:
 - `get_download_staging` reports the resolved staging/database paths and counts.
 - `list_tracked_downloads` lists recorded artifacts and whether each local file
   still exists.
-- `check_tracked_updates` checks the latest recorded download for every tracked
-  mod/package/workshop item against current official provider metadata. It can
-  filter by provider and optionally return only updates/errors. Nexus and
-  CurseForge compare the mod page update timestamp captured at download time,
-  avoiding false updates when a page hosts multiple independent files.
+- `check_tracked_updates` checks every tracked artifact against current official
+  provider metadata. It can filter by provider and optionally return only
+  updates/errors. Nexus checks follow explicit `file_updates` replacement chains
+  independently for every downloaded file, so an unrelated newer file on the
+  same multi-file page is not reported as its replacement.
+- `check_nexus_artifact_updates` performs the same exact Nexus lineage check for
+  a supplied inventory of `{mod_id, file_id}` records. Use it for Vortex exports,
+  historical manifests, or existing installs that predate the tracking database.
+  If the replacement file is also present in the supplied inventory, the older
+  record is marked `superseded_in_inventory` instead of requesting another
+  download.
+
+## TCG artifact audit utilities
+
+The repository includes two metadata-oriented utilities used to audit an
+existing TCG Card Shop Simulator Nexus archive collection without installing or
+launching the game.
+
+- `scripts/build-tcg-audit-manifest.py` discovers `.zip`, `.rar`, and `.7z`
+  archives, maps them to Nexus mod/file identities, merges duplicate local
+  copies, and writes `download-manifest.json`, `previous-metadata/`, and an
+  inventory summary. Numeric `MOD_ID-FILE_ID` names are recognized directly;
+  reviewed `STAGED.md` mappings and the tracked legacy override file cover
+  historical names.
+- `scripts/tcg-update-audit.py` compares every selected artifact with saved or
+  freshly fetched official Nexus metadata, follows explicit replacement chains,
+  distinguishes unrelated sibling files, validates that every recorded archive
+  copy exists with the expected size, and writes JSON, Markdown, and actionable
+  replacement outputs.
+
+<!-- markdownlint-disable-next-line MD013 -->
+Discover an archive tree: `scripts/build-tcg-audit-manifest.py discover DOWNLOADS_ROOT AUDIT_INVENTORY`.
+
+<!-- markdownlint-disable-next-line MD013 -->
+Merge existing manifests: `scripts/build-tcg-audit-manifest.py merge AUDIT_INVENTORY MANIFEST...`.
+
+<!-- markdownlint-disable-next-line MD013 -->
+Run a reproducible audit from saved current metadata: `scripts/tcg-update-audit.py AUDIT_OUTPUT --manifest AUDIT_INVENTORY/download-manifest.json --current-metadata CURRENT_METADATA`.
+
+The audit automatically reads historical snapshots from
+`AUDIT_INVENTORY/previous-metadata/`. Omit `--current-metadata` to fetch a new
+official metadata snapshot through the local MCP launcher instead.
 
 ## Secrets
 
@@ -124,6 +161,8 @@ Environment variables:
   bound for older/less popular results.
 - `get_mod` - fetches metadata for a known mod id.
 - `list_mod_files` - lists files for a known mod id.
+- `check_nexus_artifact_updates` - checks explicit Nexus replacement chains for
+  a supplied artifact inventory without requiring tracking-database records.
 - `get_download_links` - returns official temporary CDN links for a file id.
 - `download_mod_file` - downloads a file using an official API-provided CDN
   link.

@@ -1,6 +1,7 @@
 # Mod Downloader MCP Handoff
 
-Last verified: 2026-11-11, from the working tree based on revision `3364f9a`.
+Last verified: 2026-11-11 on `main`; this document is part of the verified
+revision.
 
 ## Purpose
 
@@ -8,6 +9,10 @@ Last verified: 2026-11-11, from the working tree based on revision `3364f9a`.
 Mods, Thunderstore, CurseForge, and Steam Workshop APIs. It provides catalog
 search, metadata lookup, official download resolution, staged downloads, durable
 download tracking, and tracked update checks.
+
+The repository also carries deterministic TCG archive-inventory and Nexus
+lineage-audit utilities under `scripts/`. Their generated inventories, metadata
+snapshots, reports, and downloaded archives belong outside Git.
 
 ## Entry points
 
@@ -30,6 +35,28 @@ generic environment variables are `MOD_DOWNLOADER_STAGING_DIR` and
 `MOD_DOWNLOADER_TRACKING_DB`; legacy Nexus download-directory configuration is
 still accepted.
 
+Nexus update checks are artifact-specific. They follow official `file_updates`
+replacement chains for every tracked or supplied `{mod_id, file_id}` identity,
+so unrelated files on the same Nexus page are not treated as replacements.
+
+## TCG audit workflow
+
+Build a deterministic inventory from an archive tree:
+
+<!-- markdownlint-disable-next-line MD013 -->
+`scripts/build-tcg-audit-manifest.py discover DOWNLOADS_ROOT AUDIT_INVENTORY`
+
+The builder writes `download-manifest.json`, `previous-metadata/`, and
+`inventory-summary.json`. Run an offline-reproducible audit with a saved current
+metadata snapshot:
+
+<!-- markdownlint-disable-next-line MD013 -->
+`scripts/tcg-update-audit.py AUDIT_OUTPUT --manifest AUDIT_INVENTORY/download-manifest.json --current-metadata CURRENT_METADATA`
+
+The audit defaults to `previous-metadata/` beside the manifest. If
+`--current-metadata` is omitted, it fetches a fresh snapshot through the local
+MCP launcher. The audit does not install mods or launch the game.
+
 ## Verification
 
 Run tests serially:
@@ -38,7 +65,19 @@ Run tests serially:
 
 Compile Python files with one worker:
 
-`PYTHONDONTWRITEBYTECODE=1 python3 -m compileall -q -j 1 nexusmods_mcp tests`
+<!-- markdownlint-disable-next-line MD013 -->
+`PYTHONDONTWRITEBYTECODE=1 python3 -m compileall -q -j 1 nexusmods_mcp tests scripts`
+
+Type-check the changed Python entry points:
+
+<!-- markdownlint-disable-next-line MD013 -->
+`MYPYPATH=. python3 -m mypy --show-error-codes --no-error-summary nexusmods_mcp/server.py scripts/tcg-update-audit.py scripts/build-tcg-audit-manifest.py`
+
+Validate both utility entry points:
+
+`scripts/build-tcg-audit-manifest.py --help`
+
+`scripts/tcg-update-audit.py --help`
 
 The protocol regression tests cover newline-delimited and Content-Length MCP
 framing, malformed requests, tool validation, error redaction, catalog search,

@@ -1,0 +1,49 @@
+[
+  {
+    "path": "arcade-audit-20261029/ArcadeMon-1.2d.zip",
+    "mod_id": 860,
+    "file_id": 4238,
+    "mod_name": "ArcadeMon",
+    "file_name": "ArcadeMon-1.2d.zip",
+    "version": "1.2d",
+    "category": "MAIN"
+  },
+  {
+    "path": "arcades-audit-20261029/Arcades-1.0.2.zip",
+    "mod_id": 1660,
+    "file_id": 7709,
+    "mod_name": "Arcades - Playable Cabinets and Pinball",
+    "author": "QOL Mods",
+    "file_name": "Arcades-1.0.2.zip",
+    "version": "1.0.2",
+    "category": "OLD_VERSION"
+  },
+  {
+    "path": "arcades-audit-20261029/Arcades-1.0.3.zip",
+    "mod_id": 1660,
+    "file_id": 9366,
+    "mod_name": "Arcades - Playable Cabinets and Pinball",
+    "author": "QOL Mods",
+    "file_name": "Arcades-1.0.3.zip",
+    "version": "1.0.3",
+    "category": "OLD_VERSION"
+  },
+  {
+    "path": "claw-audit-20261029/ClawMachine-1.0.0.zip",
+    "mod_id": 860,
+    "file_id": 4064,
+    "mod_name": "ArcadeMon",
+    "file_name": "ClawMachine-1.0.0.zip",
+    "version": "1.0.0",
+    "category": "OLD_VERSION"
+  },
+  {
+    "path": "claw-audit-20261029/ClawMachine-1.1b.zip",
+    "mod_id": 860,
+    "file_id": 4228,
+    "mod_name": "ArcadeMon",
+    "file_name": "ClawMachine-1.1b.zip",
+    "version": "1.1b",
+    "category": "MAIN"
+  }
+]

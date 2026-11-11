@@ -8,16 +8,16 @@ import re
 import sqlite3
 import sys
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from nexusmods_mcp import __version__
-
 
 API_ROOT = "https://api.nexusmods.com/v1"
 API_ROOT_V3 = "https://api.nexusmods.com/v3"
@@ -58,7 +58,7 @@ class Config:
         return self.tracking_db or self.download_dir / "downloads.sqlite3"
 
     @staticmethod
-    def load() -> "Config":
+    def load() -> Config:
         api_key = first_env("NEXUS_API_KEY", "NEXUSMODS_API_KEY", "nexus_api_key", "nexux_api_key")
         if not api_key:
             raise RuntimeError(
@@ -210,6 +210,20 @@ class DownloadTracker:
         params.append(clamp(limit, 1, 1000))
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
+        return [tracked_download_dict(row) for row in rows]
+
+    def latest_artifact_downloads(self, provider: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Return the newest record for every artifact on multi-file provider pages."""
+
+        query = (
+            "SELECT downloads.* FROM downloads "
+            "JOIN (SELECT provider, source_key, artifact_id, MAX(id) AS latest_id FROM downloads "
+            "WHERE provider = ? GROUP BY provider, source_key, artifact_id) latest "
+            "ON downloads.id = latest.latest_id "
+            "ORDER BY downloads.downloaded_at DESC, downloads.id DESC LIMIT ?"
+        )
+        with self._connect() as connection:
+            rows = connection.execute(query, (provider, clamp(limit, 1, 1000))).fetchall()
         return [tracked_download_dict(row) for row in rows]
 
     def summary(self) -> dict[str, Any]:
@@ -952,6 +966,36 @@ class McpServer:
                     int(args.get("limit", 100)),
                 ),
             ),
+            "check_nexus_artifact_updates": (
+                "Check explicit Nexus file replacement chains for a supplied artifact inventory.",
+                {
+                    "type": "object",
+                    "required": ["game_domain_name", "artifacts"],
+                    "properties": {
+                        "game_domain_name": {"type": "string"},
+                        "artifacts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["mod_id", "file_id"],
+                                "properties": {
+                                    "mod_id": {"type": "integer"},
+                                    "file_id": {"type": "integer"},
+                                    "file_name": {"type": "string"},
+                                    "version": {"type": "string"},
+                                    "path": {"type": "string"},
+                                },
+                            },
+                        },
+                        "only_updates": {"type": "boolean"},
+                    },
+                },
+                lambda args: self.check_nexus_artifact_updates(
+                    str(args["game_domain_name"]),
+                    list(args["artifacts"]),
+                    bool(args.get("only_updates", False)),
+                ),
+            ),
             "validate_api_key": (
                 "Validate the configured Nexus Mods API key and show account capability fields.",
                 {"type": "object", "properties": {}},
@@ -1248,9 +1292,74 @@ class McpServer:
         supported = {"nexus", "thunderstore", "curseforge", "steam"}
         if provider and provider not in supported:
             raise ValueError(f"provider must be one of: {', '.join(sorted(supported))}")
-        tracked = self.tracker.latest_downloads(provider=provider, limit=limit)
+        if provider == "nexus":
+            tracked = self.tracker.latest_artifact_downloads("nexus", limit)
+        elif provider:
+            tracked = self.tracker.latest_downloads(provider=provider, limit=limit)
+        else:
+            nexus = self.tracker.latest_artifact_downloads("nexus", 1000)
+            other = [
+                record
+                for record in self.tracker.latest_downloads(limit=1000)
+                if record["provider"] != "nexus"
+            ]
+            tracked = sorted(
+                [*nexus, *other],
+                key=lambda record: (int(record["downloaded_at"]), int(record["id"])),
+                reverse=True,
+            )[:clamp(limit, 1, 1000)]
         results: list[dict[str, Any]] = []
+        nexus_by_game: dict[str, list[dict[str, Any]]] = {}
+        non_nexus: list[dict[str, Any]] = []
         for record in tracked:
+            if record["provider"] != "nexus":
+                non_nexus.append(record)
+                continue
+            metadata = dict_or_empty(record.get("metadata"))
+            game_domain_name = str(metadata.get("game_domain_name") or "")
+            nexus_by_game.setdefault(game_domain_name, []).append(record)
+
+        for game_domain_name, records in nexus_by_game.items():
+            artifacts = []
+            records_by_identity: dict[tuple[int, int], dict[str, Any]] = {}
+            for record in records:
+                metadata = dict_or_empty(record.get("metadata"))
+                mod_id = int(metadata["mod_id"])
+                file_id = int(metadata.get("file_id") or record["artifact_id"])
+                identity = (mod_id, file_id)
+                records_by_identity[identity] = record
+                artifacts.append({"mod_id": mod_id, "file_id": file_id})
+            try:
+                checked = self.check_nexus_artifact_updates(game_domain_name, artifacts)
+                checked_by_identity = {
+                    (int(item["mod_id"]), int(item["file_id"])): item
+                    for item in checked["results"]
+                }
+                for identity, record in records_by_identity.items():
+                    item = checked_by_identity[identity]
+                    result = {
+                        "provider": "nexus",
+                        "source_key": record["source_key"],
+                        "tracked": record,
+                        **item,
+                        "latest": item.get("replacement") or item.get("current_file") or {},
+                    }
+                    if only_updates and result.get("update_available") is False:
+                        continue
+                    results.append(result)
+            except Exception as exc:
+                for record in records:
+                    result = {
+                        "provider": "nexus",
+                        "source_key": record["source_key"],
+                        "tracked": record,
+                        "update_available": None,
+                        "status": "metadata_unavailable",
+                        "error": self._error_text(exc),
+                    }
+                    results.append(result)
+
+        for record in non_nexus:
             try:
                 result = self._check_tracked_download(record)
             except Exception as exc:
@@ -1273,45 +1382,92 @@ class McpServer:
             "results": results,
         }
 
+    def check_nexus_artifact_updates(
+        self,
+        game_domain_name: str,
+        artifacts: list[dict[str, Any]],
+        only_updates: bool = False,
+    ) -> dict[str, Any]:
+        """Check exact Nexus artifacts without requiring tracking-database records."""
+
+        if not game_domain_name.strip():
+            raise ValueError("game_domain_name is required")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise ValueError("artifacts must be a non-empty list")
+        if len(artifacts) > 1000:
+            raise ValueError("artifacts cannot contain more than 1000 records")
+
+        by_mod: dict[int, list[dict[str, Any]]] = {}
+        identities: set[tuple[int, int]] = set()
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                raise TypeError("every artifact must be an object")
+            mod_id = int(artifact["mod_id"])
+            file_id = int(artifact["file_id"])
+            if mod_id <= 0 or file_id <= 0:
+                raise ValueError("mod_id and file_id must be positive integers")
+            identity = (mod_id, file_id)
+            if identity in identities:
+                raise ValueError(f"duplicate Nexus artifact {mod_id}:{file_id}")
+            identities.add(identity)
+            by_mod.setdefault(mod_id, []).append(dict(artifact))
+
+        results: list[dict[str, Any]] = []
+        for mod_id, selected in sorted(by_mod.items()):
+            try:
+                mod = self.client.get_mod(game_domain_name, mod_id)
+                files_payload = self.client.list_mod_files(game_domain_name, mod_id)
+                selected_ids = {int(item["file_id"]) for item in selected}
+                for artifact in selected:
+                    result = nexus_artifact_update_result(
+                        mod_id=mod_id,
+                        file_id=int(artifact["file_id"]),
+                        files_payload=files_payload,
+                        inventory_file_ids=selected_ids,
+                    )
+                    result.update(
+                        {
+                            "game_domain_name": game_domain_name,
+                            "mod_name": mod.get("name"),
+                            "author": mod.get("author") or mod.get("uploaded_by"),
+                            "selected": artifact,
+                        }
+                    )
+                    if only_updates and result.get("update_available") is False:
+                        continue
+                    results.append(result)
+            except Exception as exc:
+                for artifact in selected:
+                    results.append(
+                        {
+                            "game_domain_name": game_domain_name,
+                            "mod_id": mod_id,
+                            "file_id": int(artifact["file_id"]),
+                            "selected": artifact,
+                            "status": "metadata_unavailable",
+                            "update_available": None,
+                            "error": self._error_text(exc),
+                        }
+                    )
+
+        return {
+            "game_domain_name": game_domain_name,
+            "artifact_count": len(artifacts),
+            "mod_count": len(by_mod),
+            "updates_available": sum(item.get("update_available") is True for item in results),
+            "superseded_in_inventory": sum(
+                item.get("status") == "superseded_in_inventory" for item in results
+            ),
+            "errors": sum(bool(item.get("error")) for item in results),
+            "only_updates": only_updates,
+            "results": results,
+        }
+
     def _check_tracked_download(self, record: dict[str, Any]) -> dict[str, Any]:
         provider = record["provider"]
         metadata = dict_or_empty(record.get("metadata"))
         if provider == "nexus":
-            game_domain_name = str(metadata["game_domain_name"])
-            mod_id = int(metadata["mod_id"])
-            nexus_mod: dict[str, Any] = {}
-            try:
-                nexus_mod = self.client.get_mod(game_domain_name, mod_id)
-            except (RuntimeError, ValueError, TypeError):
-                nexus_mod = {}
-            files = [item for item in list_or_empty(self.client.list_mod_files(game_domain_name, mod_id).get("files")) if isinstance(item, dict)]
-            release_files = [item for item in files if str(item.get("category_name", "")).upper() in {"MAIN", "UPDATE"}]
-            candidates = release_files or files
-            latest = max(candidates, key=nexus_file_sort_key) if candidates else {}
-            latest_id = str(latest.get("file_id") or "")
-            file_uploaded_timestamp = integer_or_none(latest.get("uploaded_timestamp"))
-            latest_timestamp = (
-                integer_or_none(nexus_mod.get("updated_timestamp"))
-                or integer_or_none(nexus_mod.get("updated_time"))
-                or file_uploaded_timestamp
-            )
-            if record.get("remote_updated_at") is not None and latest_timestamp is not None:
-                update_available = latest_timestamp > int(record["remote_updated_at"])
-            else:
-                update_available = remote_artifact_is_newer(record, latest_id, latest_timestamp)
-            return update_check_result(
-                record,
-                update_available,
-                {
-                    "file_id": integer_or_none(latest.get("file_id")),
-                    "version": latest.get("version"),
-                    "file_name": latest.get("file_name"),
-                    "category_name": latest.get("category_name"),
-                    "uploaded_timestamp": file_uploaded_timestamp,
-                    "mod_version": nexus_mod.get("version"),
-                    "mod_updated_timestamp": latest_timestamp,
-                },
-            )
+            raise RuntimeError("Nexus tracked updates must be checked as an artifact inventory")
         if provider == "thunderstore":
             namespace = str(metadata["namespace"])
             name = str(metadata["name"])
@@ -1874,6 +2030,128 @@ def parse_remote_timestamp(value: Any) -> int | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return int(parsed.timestamp())
+
+
+def nexus_file_summary(file: dict[str, Any] | None, file_id: int | None = None) -> dict[str, Any] | None:
+    if file is None and file_id is None:
+        return None
+    source = file or {}
+    resolved_id = integer_or_none(source.get("file_id")) or file_id
+    return {
+        "file_id": resolved_id,
+        "name": source.get("name"),
+        "file_name": source.get("file_name"),
+        "version": source.get("version"),
+        "category_name": source.get("category_name"),
+        "uploaded_timestamp": integer_or_none(source.get("uploaded_timestamp")),
+        "uploaded_time": source.get("uploaded_time"),
+        "size_in_bytes": integer_or_none(source.get("size_in_bytes")),
+    }
+
+
+def nexus_artifact_update_result(
+    *,
+    mod_id: int,
+    file_id: int,
+    files_payload: dict[str, Any],
+    inventory_file_ids: set[int],
+) -> dict[str, Any]:
+    """Classify one Nexus file using explicit, chronologically valid replacement edges."""
+
+    file_index = {
+        int(item["file_id"]): item
+        for item in list_or_empty(files_payload.get("files"))
+        if isinstance(item, dict) and integer_or_none(item.get("file_id")) is not None
+    }
+    candidates: dict[int, list[tuple[int, int]]] = {}
+    anomalies: list[dict[str, Any]] = []
+    for update in list_or_empty(files_payload.get("file_updates")):
+        if not isinstance(update, dict):
+            continue
+        old_id = integer_or_none(update.get("old_file_id"))
+        new_id = integer_or_none(update.get("new_file_id"))
+        if old_id is None or new_id is None:
+            continue
+        old_timestamp = integer_or_none(file_index.get(old_id, {}).get("uploaded_timestamp")) or 0
+        replacement_timestamp = max(
+            integer_or_none(update.get("uploaded_timestamp")) or 0,
+            integer_or_none(file_index.get(new_id, {}).get("uploaded_timestamp")) or 0,
+        )
+        if old_timestamp and replacement_timestamp <= old_timestamp:
+            anomalies.append(
+                {
+                    "old_file_id": old_id,
+                    "new_file_id": new_id,
+                    "reason": "replacement_not_newer",
+                }
+            )
+            continue
+        candidates.setdefault(old_id, []).append((replacement_timestamp, new_id))
+
+    updates: dict[int, int] = {}
+    ambiguous: dict[int, list[int]] = {}
+    for old_id, replacements in candidates.items():
+        replacements.sort()
+        replacement_ids = sorted({replacement_id for _, replacement_id in replacements})
+        if len(replacement_ids) > 1:
+            ambiguous[old_id] = replacement_ids
+        updates[old_id] = replacements[-1][1]
+
+    lineage = [file_id]
+    seen = {file_id}
+    lineage_error = None
+    while lineage[-1] in updates:
+        replacement_id = updates[lineage[-1]]
+        lineage.append(replacement_id)
+        if replacement_id in seen:
+            lineage_error = "cycle"
+            break
+        seen.add(replacement_id)
+
+    current = file_index.get(file_id)
+    terminal_id = lineage[-1]
+    replacement = file_index.get(terminal_id)
+    ambiguous_steps = {str(step): ambiguous[step] for step in lineage if step in ambiguous}
+    if lineage_error:
+        status = "lineage_error"
+        update_available = None
+    elif ambiguous_steps:
+        status = "lineage_ambiguous"
+        update_available = None
+    elif len(lineage) > 1 and replacement is None:
+        status = "replacement_missing"
+        update_available = None
+    elif len(lineage) > 1 and terminal_id in inventory_file_ids:
+        status = "superseded_in_inventory"
+        update_available = False
+    elif len(lineage) > 1:
+        status = "update_available"
+        update_available = True
+    elif current is None:
+        status = "missing_unmapped"
+        update_available = None
+    elif str(current.get("category_name") or "").upper() in {"OLD_VERSION", "ARCHIVED", "DELETED"}:
+        status = "removed_or_unmapped"
+        update_available = None
+    else:
+        status = "current"
+        update_available = False
+
+    result = {
+        "mod_id": mod_id,
+        "file_id": file_id,
+        "status": status,
+        "update_available": update_available,
+        "lineage": lineage,
+        "current_file": nexus_file_summary(current, file_id),
+        "replacement": nexus_file_summary(replacement, terminal_id) if len(lineage) > 1 else None,
+        "metadata_anomalies": anomalies,
+    }
+    if lineage_error:
+        result["lineage_error"] = lineage_error
+    if ambiguous_steps:
+        result["ambiguous_replacements"] = ambiguous_steps
+    return result
 
 
 def nexus_file_sort_key(file: dict[str, Any]) -> tuple[int, int]:
