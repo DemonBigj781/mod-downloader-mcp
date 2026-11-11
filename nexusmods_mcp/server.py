@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
@@ -17,11 +20,13 @@ from nexusmods_mcp import __version__
 
 
 API_ROOT = "https://api.nexusmods.com/v1"
+API_ROOT_V3 = "https://api.nexusmods.com/v3"
 THUNDERSTORE_ROOT = "https://thunderstore.io"
 CURSEFORGE_ROOT = "https://api.curseforge.com"
 STEAM_API_ROOT = "https://api.steampowered.com"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DOWNLOAD_DIR = PROJECT_ROOT / "downloads"
+DEFAULT_STAGING_DIR = PROJECT_ROOT / "staging"
+DEFAULT_DOWNLOAD_DIR = DEFAULT_STAGING_DIR
 MIRROR_COUNTRIES = {
     "amsterdam": "NL",
     "prague": "CZ",
@@ -46,20 +51,31 @@ class Config:
     preferred_locations: tuple[str, ...]
     download_dir: Path
     max_result_chars: int
+    tracking_db: Path | None = None
+
+    @property
+    def tracking_path(self) -> Path:
+        return self.tracking_db or self.download_dir / "downloads.sqlite3"
 
     @staticmethod
     def load() -> "Config":
-        api_key = first_env("NEXUS_API_KEY", "NEXUSMODS_API_KEY", "nexux_api_key")
+        api_key = first_env("NEXUS_API_KEY", "NEXUSMODS_API_KEY", "nexus_api_key", "nexux_api_key")
         if not api_key:
             raise RuntimeError(
                 "Missing Nexus Mods API key. Set NEXUS_API_KEY, NEXUSMODS_API_KEY, "
-                "or source /var/home/jack/.bashrc.d/.secrets for nexux_api_key."
+                "nexus_api_key, or the legacy nexux_api_key alias."
             )
         country = os.environ.get("NEXUS_COUNTRY", "US").strip().upper() or "US"
         preferred = split_csv(os.environ.get("NEXUS_PREFERRED_LOCATIONS", ""))
         if country == "US" and not preferred:
             preferred = DEFAULT_US_LOCATIONS
-        download_dir = Path(os.environ.get("NEXUS_DOWNLOAD_DIR", str(DEFAULT_DOWNLOAD_DIR))).expanduser()
+        staging_value = first_env(
+            "MOD_DOWNLOADER_STAGING_DIR",
+            "NEXUS_STAGING_DIR",
+            "NEXUS_DOWNLOAD_DIR",
+        )
+        download_dir = Path(staging_value or DEFAULT_STAGING_DIR).expanduser()
+        tracking_value = first_env("MOD_DOWNLOADER_TRACKING_DB")
         return Config(
             api_key=api_key,
             thunderstore_api_key=os.environ.get("THUNDERSTORE_API_KEY", "").strip(),
@@ -69,12 +85,146 @@ class Config:
             preferred_locations=tuple(preferred),
             download_dir=download_dir,
             max_result_chars=int(os.environ.get("NEXUS_MCP_MAX_RESULT_CHARS", "16000")),
+            tracking_db=Path(tracking_value).expanduser() if tracking_value else None,
         )
 
 
+class DownloadTracker:
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = Path(database_path).expanduser()
+        self._ensure_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(self.database_path), timeout=30)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _ensure_schema(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS downloads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    artifact_id TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    remote_updated_at INTEGER,
+                    downloaded_at INTEGER NOT NULL,
+                    local_path TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS downloads_source_idx "
+                "ON downloads(provider, source_key, downloaded_at DESC, id DESC)"
+            )
+
+    def record_download(
+        self,
+        *,
+        provider: str,
+        source_key: str,
+        artifact_id: str,
+        version: str,
+        remote_updated_at: int | None,
+        local_path: Path,
+        size_bytes: int,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        path = Path(local_path).expanduser().resolve()
+        if not path.is_file():
+            raise RuntimeError(f"Downloaded artifact does not exist: {path}")
+        downloaded_at = int(time.time())
+        digest = sha256_file(path)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO downloads (
+                    provider, source_key, artifact_id, version,
+                    remote_updated_at, downloaded_at, local_path,
+                    size_bytes, sha256, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    provider,
+                    source_key,
+                    artifact_id,
+                    version,
+                    remote_updated_at,
+                    downloaded_at,
+                    str(path),
+                    int(size_bytes),
+                    digest,
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str),
+                ),
+            )
+            record_id = int(cursor.lastrowid or 0)
+        return {
+            "record_id": record_id,
+            "tracking_db": str(self.database_path),
+            "provider": provider,
+            "source_key": source_key,
+            "artifact_id": artifact_id,
+            "sha256": digest,
+        }
+
+    def list_downloads(
+        self,
+        provider: str = "",
+        limit: int = 100,
+        existing_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM downloads"
+        params: list[Any] = []
+        if provider:
+            query += " WHERE provider = ?"
+            params.append(provider)
+        query += " ORDER BY downloaded_at DESC, id DESC LIMIT ?"
+        params.append(clamp(limit, 1, 1000))
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        downloads = [tracked_download_dict(row) for row in rows]
+        if existing_only:
+            downloads = [download for download in downloads if download["local_exists"]]
+        return downloads
+
+    def latest_downloads(self, provider: str = "", limit: int = 100) -> list[dict[str, Any]]:
+        query = (
+            "SELECT downloads.* FROM downloads "
+            "JOIN (SELECT provider, source_key, MAX(id) AS latest_id FROM downloads "
+        )
+        params: list[Any] = []
+        if provider:
+            query += "WHERE provider = ? "
+            params.append(provider)
+        query += (
+            "GROUP BY provider, source_key) latest "
+            "ON downloads.id = latest.latest_id "
+            "ORDER BY downloads.downloaded_at DESC, downloads.id DESC LIMIT ?"
+        )
+        params.append(clamp(limit, 1, 1000))
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [tracked_download_dict(row) for row in rows]
+
+    def summary(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            total = int(connection.execute("SELECT COUNT(*) FROM downloads").fetchone()[0])
+            rows = connection.execute(
+                "SELECT provider, COUNT(*) AS count FROM downloads GROUP BY provider ORDER BY provider"
+            ).fetchall()
+        return {"total_downloads": total, "providers": {str(row["provider"]): int(row["count"]) for row in rows}}
+
+
 class NexusClient:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, tracker: DownloadTracker | None = None) -> None:
         self.config = config
+        self.tracker = tracker or DownloadTracker(config.tracking_path)
         self._account: dict[str, Any] | None = None
 
     def validate_api_key(self) -> dict[str, Any]:
@@ -100,49 +250,78 @@ class NexusClient:
                 break
         return matches
 
-    def search_mods(
+    def search_mod_catalog(
         self,
         game_domain_name: str,
         query: str = "",
         limit: int = 20,
-        include_updated_periods: bool = True,
+        max_pages: int = 20,
+        sort: str = "updated",
+        direction: str = "desc",
     ) -> dict[str, Any]:
-        feeds: list[tuple[str, str, dict[str, str] | None]] = [
-            ("trending", f"/games/{quote(game_domain_name)}/mods/trending.json", None),
-            ("latest_added", f"/games/{quote(game_domain_name)}/mods/latest_added.json", None),
-            ("latest_updated", f"/games/{quote(game_domain_name)}/mods/latest_updated.json", None),
-        ]
-        if include_updated_periods:
-            for period in ("1d", "1w", "1m"):
-                feeds.append((f"updated_{period}", f"/games/{quote(game_domain_name)}/mods/updated.json", {"period": period}))
-
+        game_domain_name = game_domain_name.strip()
+        if not game_domain_name:
+            raise ValueError("game_domain_name must not be empty")
+        if sort not in {"new", "updated", "endorsements", "downloads"}:
+            raise ValueError("sort must be new, updated, endorsements, or downloads")
+        if direction not in {"asc", "desc"}:
+            raise ValueError("direction must be asc or desc")
         terms = normalize_terms(query)
-        seen: set[int] = set()
         matches: list[dict[str, Any]] = []
-        errors: list[dict[str, str]] = []
         max_matches = clamp(limit, 1, 100)
-        for feed_name, path, params in feeds:
-            try:
-                mods = self.request(path, params)
-            except RuntimeError as exc:
-                errors.append({"feed": feed_name, "error": str(exc)})
-                continue
-            if not isinstance(mods, list):
-                continue
+        page_limit = clamp(max_pages, 1, 100)
+        cursor = ""
+        next_cursor: str | None = None
+        total_count: int | None = None
+        scanned_mods = 0
+        scanned_pages = 0
+
+        while scanned_pages < page_limit:
+            pagination: dict[str, Any] = {"type": "cursor", "page_size": 100}
+            if cursor:
+                pagination["cursor"] = cursor
+            payload = self.request_v3(
+                "/mods/search",
+                {
+                    "filters": {"games": [game_domain_name]},
+                    "sort": {"field": sort, "direction": direction},
+                    "pagination": pagination,
+                },
+            )
+            data = dict_or_empty(payload.get("data"))
+            mods = list_or_empty(data.get("mods"))
+            meta = dict_or_empty(payload.get("meta"))
+            scanned_pages += 1
+            scanned_mods += len(mods)
+            if isinstance(meta.get("total_count"), int):
+                total_count = meta["total_count"]
+            next_value = meta.get("next_cursor")
+            next_cursor = next_value if isinstance(next_value, str) and next_value else None
+
             for mod in mods:
-                mod_id = int(mod.get("mod_id") or mod.get("id") or 0)
-                if mod_id in seen:
+                if not isinstance(mod, dict):
                     continue
-                haystack = mod_text(mod)
+                haystack = catalog_mod_text(mod)
                 if terms and not all(term in haystack for term in terms):
                     continue
-                slim = slim_mod(mod)
-                slim["matched_feed"] = feed_name
-                matches.append(slim)
-                seen.add(mod_id)
+                matches.append(slim_catalog_mod(mod))
                 if len(matches) >= max_matches:
-                    return search_payload(game_domain_name, query, matches, errors)
-        return search_payload(game_domain_name, query, matches, errors)
+                    break
+            if len(matches) >= max_matches or next_cursor is None:
+                break
+            cursor = next_cursor
+
+        return {
+            "game_domain_name": game_domain_name,
+            "query": query,
+            "source": "Nexus Mods API v3 experimental /mods/search with local text filtering",
+            "matches": matches,
+            "scanned_pages": scanned_pages,
+            "scanned_mods": scanned_mods,
+            "total_count": total_count,
+            "catalog_exhausted": next_cursor is None,
+            "next_cursor": next_cursor,
+        }
 
     def get_mod(self, game_domain_name: str, mod_id: int) -> dict[str, Any]:
         mod = self.request(f"/games/{quote(game_domain_name)}/mods/{int(mod_id)}.json")
@@ -184,18 +363,58 @@ class NexusClient:
         if not links:
             raise RuntimeError("No official Nexus download links were returned for this file")
         selected = links[0]
-        target_dir = Path(output_dir).expanduser() if output_dir else self.config.download_dir
+        target_dir = (
+            Path(output_dir).expanduser()
+            if output_dir
+            else self.config.download_dir / "nexus" / safe_filename(game_domain_name) / str(int(mod_id))
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
         target_name = filename or filename_from_uri(selected["URI"]) or f"{game_domain_name}-{mod_id}-{file_id}.download"
         target_path = unique_path(target_dir / safe_filename(target_name))
+        file_metadata: dict[str, Any] = {}
+        mod_metadata: dict[str, Any] = {}
+        try:
+            files = list_or_empty(self.list_mod_files(game_domain_name, mod_id).get("files"))
+            file_metadata = next(
+                (dict(item) for item in files if isinstance(item, dict) and int(item.get("file_id") or 0) == int(file_id)),
+                {},
+            )
+        except (RuntimeError, ValueError, TypeError):
+            file_metadata = {}
+        try:
+            mod_metadata = self.get_mod(game_domain_name, mod_id)
+        except (RuntimeError, ValueError, TypeError):
+            mod_metadata = {}
         started = time.time()
         size = download_uri(selected["URI"], target_path)
+        tracking = self.tracker.record_download(
+            provider="nexus",
+            source_key=f"{game_domain_name}:{int(mod_id)}",
+            artifact_id=str(int(file_id)),
+            version=str(file_metadata.get("version") or mod_metadata.get("version") or ""),
+            remote_updated_at=(
+                integer_or_none(mod_metadata.get("updated_timestamp"))
+                or integer_or_none(mod_metadata.get("updated_time"))
+                or integer_or_none(file_metadata.get("uploaded_timestamp"))
+            ),
+            local_path=target_path,
+            size_bytes=size,
+            metadata={
+                "game_domain_name": game_domain_name,
+                "mod_id": int(mod_id),
+                "file_id": int(file_id),
+                "mod": mod_metadata,
+                "file": file_metadata,
+                "selected_mirror": {key: selected[key] for key in selected if key != "URI"},
+            },
+        )
         return {
             "downloaded": str(target_path),
             "bytes": size,
             "duration_seconds": round(time.time() - started, 2),
             "selected_mirror": {key: selected[key] for key in selected if key != "URI"},
             "selection_reason": selected.get("selection_reason", ""),
+            "tracking": tracking,
         }
 
     def account(self) -> dict[str, Any]:
@@ -235,10 +454,36 @@ class NexusClient:
             raise RuntimeError(f"Nexus API request failed for {path}: {exc}") from exc
         return json.loads(body.decode("utf-8"))
 
+    def request_v3(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        req = Request(
+            f"{API_ROOT_V3}{path}",
+            data=json.dumps(body, separators=(",", ":")).encode("utf-8"),
+            headers={
+                "apikey": self.config.api_key,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "nexusmods-mcp/0.2.0",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=60) as resp:
+                response_body = resp.read()
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            raise RuntimeError(f"Nexus API v3 HTTP {exc.code} for {path}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Nexus API v3 request failed for {path}: {exc}") from exc
+        payload = json.loads(response_body.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unexpected Nexus API v3 response")
+        return payload
+
 
 class ThunderstoreClient:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, tracker: DownloadTracker | None = None) -> None:
         self.config = config
+        self.tracker = tracker or DownloadTracker(config.tracking_path)
 
     def list_communities(self, query: str = "", limit: int = 20) -> dict[str, Any]:
         terms = normalize_terms(query)
@@ -327,20 +572,41 @@ class ThunderstoreClient:
         download_url = str(version_payload.get("download_url", ""))
         if not download_url:
             raise RuntimeError("Thunderstore package version did not include download_url")
-        target_dir = Path(output_dir).expanduser() if output_dir else self.config.download_dir / "thunderstore"
+        target_dir = (
+            Path(output_dir).expanduser()
+            if output_dir
+            else self.config.download_dir / "thunderstore" / safe_filename(namespace) / safe_filename(name)
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
         target_name = filename or filename_from_uri(download_url) or f"{namespace}-{name}-{version_payload.get('version_number', 'latest')}.zip"
         target_path = unique_path(target_dir / safe_filename(target_name))
         started = time.time()
         size = download_uri(download_url, target_path)
+        resolved_version = str(version_payload.get("version_number") or version)
+        tracking = self.tracker.record_download(
+            provider="thunderstore",
+            source_key=f"{namespace}:{name}",
+            artifact_id=resolved_version,
+            version=resolved_version,
+            remote_updated_at=parse_remote_timestamp(version_payload.get("date_created")),
+            local_path=target_path,
+            size_bytes=size,
+            metadata={
+                "namespace": namespace,
+                "name": name,
+                "version": resolved_version,
+                "package_version": version_payload,
+            },
+        )
         return {
             "downloaded": str(target_path),
             "bytes": size,
             "duration_seconds": round(time.time() - started, 2),
             "namespace": namespace,
             "name": name,
-            "version": version_payload.get("version_number", version),
+            "version": resolved_version,
             "download_url": download_url,
+            "tracking": tracking,
         }
 
     def latest_version(self, namespace: str, name: str) -> dict[str, Any]:
@@ -369,8 +635,9 @@ class ThunderstoreClient:
 
 
 class CurseForgeClient:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, tracker: DownloadTracker | None = None) -> None:
         self.config = config
+        self.tracker = tracker or DownloadTracker(config.tracking_path)
 
     def list_games(self, query: str = "", limit: int = 20, index: int = 0) -> dict[str, Any]:
         terms = normalize_terms(query)
@@ -457,12 +724,48 @@ class CurseForgeClient:
     def download_file(self, mod_id: int, file_id: int, output_dir: str = "", filename: str = "") -> dict[str, Any]:
         payload = self.get_download_url(mod_id, file_id)
         download_url = payload["download_url"]
-        target_dir = Path(output_dir).expanduser() if output_dir else self.config.download_dir / "curseforge"
+        target_dir = (
+            Path(output_dir).expanduser()
+            if output_dir
+            else self.config.download_dir / "curseforge" / str(int(mod_id))
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
         target_name = filename or filename_from_uri(download_url) or f"curseforge-{mod_id}-{file_id}.download"
         target_path = unique_path(target_dir / safe_filename(target_name))
+        file_metadata: dict[str, Any] = {}
+        mod_metadata: dict[str, Any] = {}
+        try:
+            files = list_or_empty(self.get_mod_files(mod_id, page_size=50).get("files"))
+            file_metadata = next(
+                (dict(item) for item in files if isinstance(item, dict) and int(item.get("id") or 0) == int(file_id)),
+                {},
+            )
+        except (RuntimeError, ValueError, TypeError):
+            file_metadata = {}
+        try:
+            mod_metadata = self.get_mod(mod_id)
+        except (RuntimeError, ValueError, TypeError):
+            mod_metadata = {}
         started = time.time()
         size = download_uri(download_url, target_path)
+        tracking = self.tracker.record_download(
+            provider="curseforge",
+            source_key=str(int(mod_id)),
+            artifact_id=str(int(file_id)),
+            version=str(file_metadata.get("displayName") or file_metadata.get("fileName") or ""),
+            remote_updated_at=(
+                parse_remote_timestamp(mod_metadata.get("dateModified"))
+                or parse_remote_timestamp(file_metadata.get("fileDate"))
+            ),
+            local_path=target_path,
+            size_bytes=size,
+            metadata={
+                "mod_id": int(mod_id),
+                "file_id": int(file_id),
+                "mod": mod_metadata,
+                "file": file_metadata,
+            },
+        )
         return {
             "downloaded": str(target_path),
             "bytes": size,
@@ -470,6 +773,7 @@ class CurseForgeClient:
             "mod_id": int(mod_id),
             "file_id": int(file_id),
             "download_url": download_url,
+            "tracking": tracking,
         }
 
     def request(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -500,8 +804,9 @@ class CurseForgeClient:
 
 
 class SteamClient:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, tracker: DownloadTracker | None = None) -> None:
         self.config = config
+        self.tracker = tracker or DownloadTracker(config.tracking_path)
 
     def search_workshop(self, app_id: int, query: str = "", page: int = 1, page_size: int = 20) -> dict[str, Any]:
         if not self.config.steam_api_key:
@@ -560,16 +865,32 @@ class SteamClient:
         file_url = info.get("file_url")
         if not isinstance(file_url, str) or not file_url:
             return {"downloaded": None, **info}
-        target_dir = Path(output_dir).expanduser() if output_dir else self.config.download_dir / "steam"
+        target_dir = (
+            Path(output_dir).expanduser()
+            if output_dir
+            else self.config.download_dir / "steam" / str(int(published_file_id))
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
         target_name = filename or filename_from_uri(file_url) or f"steam-workshop-{published_file_id}.download"
         target_path = unique_path(target_dir / safe_filename(target_name))
         started = time.time()
         size = download_uri(file_url, target_path)
+        item = dict_or_empty(info.get("item"))
+        tracking = self.tracker.record_download(
+            provider="steam",
+            source_key=str(int(published_file_id)),
+            artifact_id=str(int(published_file_id)),
+            version=str(item.get("time_updated") or ""),
+            remote_updated_at=integer_or_none(item.get("time_updated")),
+            local_path=target_path,
+            size_bytes=size,
+            metadata={"published_file_id": int(published_file_id), "item": item},
+        )
         return {
             "downloaded": str(target_path),
             "bytes": size,
             "duration_seconds": round(time.time() - started, 2),
+            "tracking": tracking,
             **info,
         }
 
@@ -586,11 +907,51 @@ class SteamClient:
 class McpServer:
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.client = NexusClient(config)
-        self.thunderstore = ThunderstoreClient(config)
-        self.curseforge = CurseForgeClient(config)
-        self.steam = SteamClient(config)
+        self.tracker = DownloadTracker(config.tracking_path)
+        self.client = NexusClient(config, self.tracker)
+        self.thunderstore = ThunderstoreClient(config, self.tracker)
+        self.curseforge = CurseForgeClient(config, self.tracker)
+        self.steam = SteamClient(config, self.tracker)
         self.tools: dict[str, tuple[str, dict[str, Any], Callable[[dict[str, Any]], Any]]] = {
+            "get_download_staging": (
+                "Show the shared staging directory, tracking database, and recorded download counts.",
+                {"type": "object", "properties": {}},
+                lambda _args: self.download_staging(),
+            ),
+            "list_tracked_downloads": (
+                "List mod archives recorded by this MCP across Nexus, Thunderstore, CurseForge, and Steam.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "provider": {"type": "string"},
+                        "limit": {"type": "integer"},
+                        "existing_only": {"type": "boolean"},
+                    },
+                },
+                lambda args: {
+                    "downloads": self.tracker.list_downloads(
+                        str(args.get("provider", "")),
+                        int(args.get("limit", 100)),
+                        bool(args.get("existing_only", False)),
+                    )
+                },
+            ),
+            "check_tracked_updates": (
+                "Check official provider metadata for updates to the latest recorded download of each tracked mod or package.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "provider": {"type": "string"},
+                        "only_updates": {"type": "boolean"},
+                        "limit": {"type": "integer"},
+                    },
+                },
+                lambda args: self.check_tracked_updates(
+                    str(args.get("provider", "")),
+                    bool(args.get("only_updates", False)),
+                    int(args.get("limit", 100)),
+                ),
+            ),
             "validate_api_key": (
                 "Validate the configured Nexus Mods API key and show account capability fields.",
                 {"type": "object", "properties": {}},
@@ -613,7 +974,7 @@ class McpServer:
                 ),
             ),
             "search_mods": (
-                "Search official Nexus API mod feeds for a game; Nexus API v1 has no broad text search endpoint.",
+                "Search the official Nexus API v3 mod catalog for a game, with bounded local text matching over mod metadata.",
                 {
                     "type": "object",
                     "required": ["game_domain_name"],
@@ -621,14 +982,18 @@ class McpServer:
                         "game_domain_name": {"type": "string"},
                         "query": {"type": "string"},
                         "limit": {"type": "integer"},
-                        "include_updated_periods": {"type": "boolean"},
+                        "max_pages": {"type": "integer"},
+                        "sort": {"type": "string"},
+                        "direction": {"type": "string"},
                     },
                 },
-                lambda args: self.client.search_mods(
+                lambda args: self.client.search_mod_catalog(
                     str(args["game_domain_name"]),
                     str(args.get("query", "")),
                     int(args.get("limit", 20)),
-                    bool(args.get("include_updated_periods", True)),
+                    int(args.get("max_pages", 20)),
+                    str(args.get("sort", "updated")),
+                    str(args.get("direction", "desc")),
                 ),
             ),
             "get_mod": (
@@ -866,13 +1231,154 @@ class McpServer:
             ),
         }
 
-    def handle(self, message: dict[str, Any]) -> dict[str, Any] | None:
+    def download_staging(self) -> dict[str, Any]:
+        self.config.download_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "staging_dir": str(self.config.download_dir.resolve()),
+            "tracking_db": str(self.config.tracking_path.resolve()),
+            **self.tracker.summary(),
+        }
+
+    def check_tracked_updates(
+        self,
+        provider: str = "",
+        only_updates: bool = False,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        supported = {"nexus", "thunderstore", "curseforge", "steam"}
+        if provider and provider not in supported:
+            raise ValueError(f"provider must be one of: {', '.join(sorted(supported))}")
+        tracked = self.tracker.latest_downloads(provider=provider, limit=limit)
+        results: list[dict[str, Any]] = []
+        for record in tracked:
+            try:
+                result = self._check_tracked_download(record)
+            except Exception as exc:
+                result = {
+                    "provider": record["provider"],
+                    "source_key": record["source_key"],
+                    "tracked": record,
+                    "update_available": None,
+                    "error": self._error_text(exc),
+                }
+            if only_updates and result.get("update_available") is False:
+                continue
+            results.append(result)
+        return {
+            "provider": provider or "all",
+            "tracked_sources": len(tracked),
+            "updates_available": sum(result.get("update_available") is True for result in results),
+            "errors": sum(bool(result.get("error")) for result in results),
+            "only_updates": only_updates,
+            "results": results,
+        }
+
+    def _check_tracked_download(self, record: dict[str, Any]) -> dict[str, Any]:
+        provider = record["provider"]
+        metadata = dict_or_empty(record.get("metadata"))
+        if provider == "nexus":
+            game_domain_name = str(metadata["game_domain_name"])
+            mod_id = int(metadata["mod_id"])
+            nexus_mod: dict[str, Any] = {}
+            try:
+                nexus_mod = self.client.get_mod(game_domain_name, mod_id)
+            except (RuntimeError, ValueError, TypeError):
+                nexus_mod = {}
+            files = [item for item in list_or_empty(self.client.list_mod_files(game_domain_name, mod_id).get("files")) if isinstance(item, dict)]
+            release_files = [item for item in files if str(item.get("category_name", "")).upper() in {"MAIN", "UPDATE"}]
+            candidates = release_files or files
+            latest = max(candidates, key=nexus_file_sort_key) if candidates else {}
+            latest_id = str(latest.get("file_id") or "")
+            file_uploaded_timestamp = integer_or_none(latest.get("uploaded_timestamp"))
+            latest_timestamp = (
+                integer_or_none(nexus_mod.get("updated_timestamp"))
+                or integer_or_none(nexus_mod.get("updated_time"))
+                or file_uploaded_timestamp
+            )
+            if record.get("remote_updated_at") is not None and latest_timestamp is not None:
+                update_available = latest_timestamp > int(record["remote_updated_at"])
+            else:
+                update_available = remote_artifact_is_newer(record, latest_id, latest_timestamp)
+            return update_check_result(
+                record,
+                update_available,
+                {
+                    "file_id": integer_or_none(latest.get("file_id")),
+                    "version": latest.get("version"),
+                    "file_name": latest.get("file_name"),
+                    "category_name": latest.get("category_name"),
+                    "uploaded_timestamp": file_uploaded_timestamp,
+                    "mod_version": nexus_mod.get("version"),
+                    "mod_updated_timestamp": latest_timestamp,
+                },
+            )
+        if provider == "thunderstore":
+            namespace = str(metadata["namespace"])
+            name = str(metadata["name"])
+            latest = self.thunderstore.latest_version(namespace, name)
+            latest_version = str(latest.get("version_number") or "")
+            latest_timestamp = parse_remote_timestamp(latest.get("date_created"))
+            update_available = remote_artifact_is_newer(record, latest_version, latest_timestamp)
+            return update_check_result(
+                record,
+                update_available,
+                {
+                    "version": latest_version,
+                    "date_created": latest.get("date_created"),
+                    "download_url": latest.get("download_url"),
+                },
+            )
+        if provider == "curseforge":
+            mod_id = int(metadata["mod_id"])
+            curseforge_mod: dict[str, Any] = {}
+            try:
+                curseforge_mod = self.curseforge.get_mod(mod_id)
+            except (RuntimeError, ValueError, TypeError):
+                curseforge_mod = {}
+            files = [item for item in list_or_empty(self.curseforge.get_mod_files(mod_id, page_size=50).get("files")) if isinstance(item, dict)]
+            latest = max(files, key=curseforge_file_sort_key) if files else {}
+            latest_id = str(latest.get("id") or "")
+            latest_timestamp = (
+                parse_remote_timestamp(curseforge_mod.get("dateModified"))
+                or parse_remote_timestamp(latest.get("fileDate"))
+            )
+            if record.get("remote_updated_at") is not None and latest_timestamp is not None:
+                update_available = latest_timestamp > int(record["remote_updated_at"])
+            else:
+                update_available = remote_artifact_is_newer(record, latest_id, latest_timestamp)
+            latest_result = dict(latest)
+            latest_result["mod_date_modified"] = curseforge_mod.get("dateModified")
+            return update_check_result(record, update_available, latest_result)
+        if provider == "steam":
+            published_file_id = int(metadata["published_file_id"])
+            details = self.steam.get_workshop_details([published_file_id]).get("details", [])
+            latest = dict(details[0]) if details else {}
+            latest_timestamp = integer_or_none(latest.get("time_updated"))
+            update_available = bool(
+                latest_timestamp is not None
+                and latest_timestamp > int(record.get("remote_updated_at") or 0)
+            )
+            return update_check_result(record, update_available, latest)
+        raise ValueError(f"Unsupported tracked provider: {provider}")
+
+    def handle(self, message: Any) -> dict[str, Any] | None:
+        if not isinstance(message, dict):
+            return self.error({"id": None}, -32600, "Invalid Request: expected an object")
+        if "id" in message and message["id"] is not None and type(message["id"]) not in (str, int):
+            return self.error({"id": None}, -32600, "Invalid Request: invalid request id")
+        if message.get("jsonrpc") != "2.0" or not isinstance(message.get("method"), str):
+            return self.error(message, -32600, "Invalid Request")
         if "id" not in message:
             return None
         method = message.get("method")
+        params = message.get("params", {})
+        if not isinstance(params, dict):
+            return self.error(message, -32602, "Invalid params: expected an object")
         try:
+            if method == "ping":
+                return self.result(message, {})
             if method == "initialize":
-                requested_version = message.get("params", {}).get("protocolVersion", "2024-11-05")
+                requested_version = params.get("protocolVersion", "2024-11-05")
                 return self.result(
                     message,
                     {
@@ -884,19 +1390,34 @@ class McpServer:
             if method == "tools/list":
                 return self.result(message, {"tools": self._tool_descriptions()})
             if method == "tools/call":
-                params = message.get("params", {})
                 name = params.get("name")
-                args = params.get("arguments") or {}
-                if name not in self.tools:
-                    raise ValueError(f"Unknown tool: {name}")
-                payload = self.tools[name][2](args)
-                return self.result(
-                    message,
-                    {"content": [{"type": "text", "text": truncate_payload(payload, self.config.max_result_chars)}]},
-                )
+                args = params.get("arguments", {})
+                if not isinstance(name, str) or name not in self.tools:
+                    return self.error(message, -32602, "Unknown tool")
+                try:
+                    validate_tool_arguments(args, self.tools[name][1])
+                except ValueError as exc:
+                    return self.error(message, -32602, str(exc))
+                try:
+                    payload = self.tools[name][2](args)
+                    text = truncate_payload(payload, self.config.max_result_chars)
+                except Exception as exc:
+                    return self.result(message, {
+                        "isError": True,
+                        "content": [{"type": "text", "text": f"{name}: {self._error_text(exc)}"}],
+                    })
+                return self.result(message, {"content": [{"type": "text", "text": text}]})
             return self.error(message, -32601, f"Method not found: {method}")
         except Exception as exc:
-            return self.error(message, -32000, str(exc))
+            return self.error(message, -32603, self._error_text(exc))
+
+    def _error_text(self, error: Exception) -> str:
+        text = str(error) or type(error).__name__
+        for secret in (self.config.api_key, self.config.thunderstore_api_key,
+                       self.config.curseforge_api_key, self.config.steam_api_key):
+            if secret:
+                text = text.replace(secret, "[redacted]")
+        return text[:2000]
 
     def _tool_descriptions(self) -> list[dict[str, Any]]:
         return [
@@ -910,7 +1431,26 @@ class McpServer:
 
     @staticmethod
     def error(message: dict[str, Any], code: int, text: str) -> dict[str, Any]:
-        return {"jsonrpc": "2.0", "id": message["id"], "error": {"code": code, "message": text}}
+        return {"jsonrpc": "2.0", "id": message.get("id"), "error": {"code": code, "message": text}}
+
+
+def validate_tool_arguments(args: Any, schema: dict[str, Any]) -> None:
+    if not isinstance(args, dict):
+        raise ValueError("Tool arguments must be an object")
+    for name in schema.get("required", []):
+        if name not in args:
+            raise ValueError(f"Missing required argument: {name}")
+    types = {"string": str, "integer": int, "boolean": bool, "array": list, "object": dict}
+    for name, spec in schema.get("properties", {}).items():
+        if name not in args:
+            continue
+        expected = types.get(spec.get("type"))
+        if expected is not None and type(args[name]) is not expected:
+            raise ValueError(f"Argument {name} must be {spec['type']}")
+        if spec.get("type") == "array" and spec.get("items", {}).get("type") in types:
+            item_type = types[spec["items"]["type"]]
+            if any(type(value) is not item_type for value in args[name]):
+                raise ValueError(f"Argument {name} contains an invalid item type")
 
 
 def download_schema() -> dict[str, Any]:
@@ -1063,22 +1603,33 @@ def slim_game(game: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def slim_mod(mod: dict[str, Any]) -> dict[str, Any]:
-    keys = (
-        "mod_id",
-        "name",
-        "summary",
-        "version",
-        "author",
-        "category_id",
-        "endorsement_count",
-        "download_count",
-        "updated_time",
-        "mod_downloads",
-        "domain_name",
-        "nexusmods_url",
-    )
-    return {key: mod.get(key) for key in keys if key in mod}
+def slim_catalog_mod(mod: dict[str, Any]) -> dict[str, Any]:
+    game = dict_or_empty(mod.get("game"))
+    author = dict_or_empty(mod.get("author"))
+    category = dict_or_empty(mod.get("category"))
+    return {
+        "id": mod.get("id"),
+        "game_scoped_id": mod.get("game_scoped_id"),
+        "game_domain_name": game.get("domain_name"),
+        "game_name": game.get("name"),
+        "name": mod.get("name"),
+        "summary": mod.get("summary"),
+        "version": mod.get("version"),
+        "author": author.get("name"),
+        "category": category.get("name"),
+        "endorsements": mod.get("endorsements"),
+        "downloads": mod.get("downloads"),
+        "unique_downloads": mod.get("unique_downloads"),
+        "updated_at": mod.get("updated_at"),
+        "created_at": mod.get("created_at"),
+        "adult": mod.get("adult"),
+        "supports_vortex": mod.get("supports_vortex"),
+        "nexusmods_url": (
+            f"https://www.nexusmods.com/{game.get('domain_name')}/mods/{mod.get('game_scoped_id')}"
+            if game.get("domain_name") and mod.get("game_scoped_id")
+            else None
+        ),
+    }
 
 
 def slim_thunderstore_package(package: dict[str, Any]) -> dict[str, Any]:
@@ -1239,14 +1790,17 @@ def cursor_from_next(next_url: Any) -> str:
     return values[0] if values else ""
 
 
-def search_payload(game_domain_name: str, query: str, matches: list[dict[str, Any]], errors: list[dict[str, str]]) -> dict[str, Any]:
-    note = "Nexus Mods API v1 does not expose broad full-text mod search; searched official mod feeds only."
-    return {"game_domain_name": game_domain_name, "query": query, "note": note, "matches": matches, "errors": errors}
-
-
-def mod_text(mod: dict[str, Any]) -> str:
-    fields = ("name", "summary", "description", "author", "version")
-    return " ".join(str(mod.get(field, "")) for field in fields).lower()
+def catalog_mod_text(mod: dict[str, Any]) -> str:
+    author = dict_or_empty(mod.get("author"))
+    category = dict_or_empty(mod.get("category"))
+    fields = (
+        mod.get("name", ""),
+        mod.get("summary", ""),
+        mod.get("version", ""),
+        author.get("name", ""),
+        category.get("name", ""),
+    )
+    return " ".join(str(field) for field in fields).lower()
 
 
 def normalize_terms(query: str) -> list[str]:
@@ -1263,6 +1817,109 @@ def first_env(*names: str) -> str:
 
 def split_csv(value: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def tracked_download_dict(row: sqlite3.Row) -> dict[str, Any]:
+    metadata_text = str(row["metadata_json"] or "{}")
+    try:
+        metadata = json.loads(metadata_text)
+    except json.JSONDecodeError:
+        metadata = {"tracking_error": "invalid metadata_json"}
+    local_path = str(row["local_path"])
+    return {
+        "id": int(row["id"]),
+        "provider": str(row["provider"]),
+        "source_key": str(row["source_key"]),
+        "artifact_id": str(row["artifact_id"]),
+        "version": str(row["version"]),
+        "remote_updated_at": integer_or_none(row["remote_updated_at"]),
+        "downloaded_at": int(row["downloaded_at"]),
+        "downloaded_at_iso": datetime.fromtimestamp(int(row["downloaded_at"]), timezone.utc).isoformat(),
+        "local_path": local_path,
+        "local_exists": Path(local_path).is_file(),
+        "size_bytes": int(row["size_bytes"]),
+        "sha256": str(row["sha256"]),
+        "metadata": metadata if isinstance(metadata, dict) else {},
+    }
+
+
+def integer_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_remote_timestamp(value: Any) -> int | None:
+    numeric = integer_or_none(value)
+    if numeric is not None:
+        return numeric
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+def nexus_file_sort_key(file: dict[str, Any]) -> tuple[int, int]:
+    return (
+        integer_or_none(file.get("uploaded_timestamp")) or 0,
+        integer_or_none(file.get("file_id")) or 0,
+    )
+
+
+def curseforge_file_sort_key(file: dict[str, Any]) -> tuple[int, int]:
+    return (
+        parse_remote_timestamp(file.get("fileDate")) or 0,
+        integer_or_none(file.get("id")) or 0,
+    )
+
+
+def remote_artifact_is_newer(
+    record: dict[str, Any],
+    latest_artifact_id: str,
+    latest_updated_at: int | None,
+) -> bool:
+    current_artifact_id = str(record.get("artifact_id") or "")
+    current_updated_at = integer_or_none(record.get("remote_updated_at"))
+    if not latest_artifact_id or latest_artifact_id == current_artifact_id:
+        return False
+    if current_updated_at is not None and latest_updated_at is not None:
+        return latest_updated_at > current_updated_at
+    current_numeric = integer_or_none(current_artifact_id)
+    latest_numeric = integer_or_none(latest_artifact_id)
+    if current_numeric is not None and latest_numeric is not None:
+        return latest_numeric > current_numeric
+    return True
+
+
+def update_check_result(
+    record: dict[str, Any],
+    update_available: bool,
+    latest: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "provider": record["provider"],
+        "source_key": record["source_key"],
+        "update_available": update_available,
+        "tracked": record,
+        "latest": latest,
+    }
 
 
 def clamp(value: int, low: int, high: int) -> int:
@@ -1339,7 +1996,18 @@ def escape_uri_path(uri: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, escaped_path, parsed.params, parsed.query, parsed.fragment))
 
 
-def read_messages(stream: Any) -> Iterable[tuple[dict[str, Any], str]]:
+class McpParseError(ValueError):
+    pass
+
+
+def decode_message(body: bytes) -> Any:
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return McpParseError("Parse error")
+
+
+def read_messages(stream: Any) -> Iterable[tuple[Any, str]]:
     while True:
         first_line = stream.readline()
         if not first_line:
@@ -1347,16 +2015,23 @@ def read_messages(stream: Any) -> Iterable[tuple[dict[str, Any], str]]:
         if first_line in (b"\n", b"\r\n"):
             continue
         stripped = first_line.lstrip()
-        if stripped.startswith((b"{", b"[")) or b":" not in first_line:
-            yield json.loads(first_line.decode("utf-8")), "json-line"
+        if not stripped.lower().startswith((b"content-length:", b"content-type:")):
+            yield decode_message(first_line), "json-line"
             continue
 
-        headers = parse_headers(first_line, stream)
-        length_value = headers.get("content-length")
-        if length_value is None:
-            raise ValueError(f"Missing Content-Length header: {headers}")
-        body = stream.read(int(length_value))
-        yield json.loads(body.decode("utf-8")), "framed"
+        try:
+            headers = parse_headers(first_line, stream)
+            length = int(headers["content-length"])
+            if length < 0:
+                raise ValueError("Negative content length")
+        except (KeyError, ValueError):
+            yield McpParseError("Invalid framing"), "framed"
+            return
+        body = stream.read(length)
+        if len(body) != length:
+            yield McpParseError("Truncated frame"), "framed"
+            return
+        yield decode_message(body), "framed"
 
 
 def parse_headers(first_line: bytes, stream: Any) -> dict[str, str]:
@@ -1381,7 +2056,7 @@ def write_message(stream: Any, message: dict[str, Any], mode: str = "framed") ->
 def run_stdio(config: Config) -> None:
     server = McpServer(config)
     for message, mode in read_messages(sys.stdin.buffer):
-        response = server.handle(message)
+        response = server.error({"id": None}, -32700, "Parse error") if isinstance(message, McpParseError) else server.handle(message)
         if response is not None:
             write_message(sys.stdout.buffer, response, mode)
 

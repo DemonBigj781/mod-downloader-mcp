@@ -1,7 +1,7 @@
 [project]
 name = "mod-downloader-mcp"
-version = "0.1.0"
-description = "MCP server for Nexus Mods API search, metadata, and downloads."
+version = "0.3.0"
+description = "MCP server for official mod-host search, staged downloads, tracking, and update checks."
 requires-python = ">=3.10"
 dependencies = []
 
